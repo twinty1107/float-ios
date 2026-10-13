@@ -4,7 +4,7 @@ import WebKit
 /// Native WKWebView shell around https://meou123.netlify.app/
 /// Keeps the PWA inside the app, locks portrait, handles camera/mic uploads,
 /// opens off-site links in Safari and shows a branded offline screen.
-final class WebAppViewController: UIViewController {
+final class WebAppViewController: UIViewController, UIGestureRecognizerDelegate {
 
     // MARK: - Configuration
 
@@ -52,6 +52,19 @@ final class WebAppViewController: UIViewController {
     }
 
     override var supportedInterfaceOrientations: UIInterfaceOrientationMask { .portrait }
+
+    // MARK: - UIGestureRecognizerDelegate
+
+    /// 让点按收起键盘的手势与网页自身的点击/滚动并存
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
+                           shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
+        true
+    }
+
+    /// 键盘没弹出来时不需要识别，省掉无谓的 JS 查询
+    func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+        webView?.isFirstResponder ?? false
+    }
 
     // MARK: - Setup
 
@@ -105,6 +118,32 @@ final class WebAppViewController: UIViewController {
         refresh.tintColor = .secondaryLabel
         refresh.addTarget(self, action: #selector(handleRefresh), for: .valueChanged)
         webView.scrollView.refreshControl = refresh
+
+        stripInputAssistantBars()
+        installTapToDismissKeyboard()
+    }
+
+    // MARK: - 去掉键盘上方的输入助手栏
+
+    /// WKWebView 会在键盘上方插入系统的 inputAssistantItem 栏
+    /// （上一个/下一个输入框的箭头 + “完成”按钮）。网页无法控制它，只能清空。
+    /// 代价：失去“上一个/下一个”快捷切换；键盘收起改用下拉与点按空白处。
+    private func stripInputAssistantBars() {
+        if #available(iOS 13.0, *) {
+            clearAssistantGroups(everywhereIn: webView)
+            clearAssistantGroups(everywhereIn: webView.scrollView)
+        }
+    }
+
+    private func clearAssistantGroups(everywhereIn view: UIView) {
+        // 用 KVC 访问 inputAssistantItem：UIKit 未公开为协议要求，但所有 UIView 都响应
+        if let item = view.value(forKey: "inputAssistantItem") as? UITextInputAssistantItem {
+            item.leadingBarButtonGroups = []
+            item.trailingBarButtonGroups = []
+        }
+        for sub in view.subviews {
+            clearAssistantGroups(everywhereIn: sub)
+        }
     }
 
     /// 安全区兜底：站点若已用 env(safe-area-inset-*) 自行避让，这里什么都不做；
@@ -273,6 +312,8 @@ final class WebAppViewController: UIViewController {
             webView.scrollView.contentInset.bottom = inset
             webView.scrollView.verticalScrollIndicatorInsets.bottom = inset
         } completion: { _ in
+            // WebKit 可能在聚焦时才创建内部视图，这里再清一次输入助手栏
+            self.stripInputAssistantBars()
             if inset > 0 {
                 // 键盘完全展开后，把正在输入的控件滚进可视区
                 webView.evaluateJavaScript("""
@@ -283,6 +324,34 @@ final class WebAppViewController: UIViewController {
                   }
                 })();
                 """, completionHandler: nil)
+            }
+        }
+    }
+
+    // MARK: - 点按空白处收起键盘
+
+    /// 输入助手栏被移除后，“完成”按钮也没了，所以补一个点击空白收起键盘的手势。
+    private func installTapToDismissKeyboard() {
+        let tap = UITapGestureRecognizer(target: self, action: #selector(handleBackgroundTap))
+        tap.cancelsTouchesInView = false          // 不能吃掉网页自身的点击
+        tap.delegate = self
+        webView.addGestureRecognizer(tap)
+    }
+
+    @objc private func handleBackgroundTap() {
+        guard webView.isFirstResponder else { return }
+        // 只有当点到的不是可输入元素时才收起键盘
+        webView.evaluateJavaScript("""
+        (function () {
+          var el = document.elementFromPoint(window.innerWidth / 2, window.innerHeight / 2);
+          var active = document.activeElement;
+          var editable = active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.isContentEditable);
+          var tappedEditable = el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable);
+          return editable && !tappedEditable;
+        })();
+        """) { [weak self] result, _ in
+            if let shouldDismiss = result as? Bool, shouldDismiss {
+                self?.webView.endEditing(true)
             }
         }
     }
