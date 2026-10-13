@@ -193,7 +193,8 @@ final class WebAppViewController: UIViewController, UIGestureRecognizerDelegate 
             object_setClass(view, existing)
             return
         }
-        guard let subclass = objc_allocateClassPair(originalClass, (subclassName as NSString).utf8String, 0) else {
+        guard let subclassNameCString = (subclassName as NSString).utf8String,
+              let subclass = objc_allocateClassPair(originalClass, subclassNameCString, 0) else {
             return
         }
         typealias InputAccessoryBlock = @convention(block) (AnyObject) -> UIView?
