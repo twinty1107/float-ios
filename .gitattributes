@@ -1,0 +1,33 @@
+# 行尾锁定：这个工程要在 macOS 上编译，脚本和工程文件必须是 LF。
+# Windows 上 core.autocrlf=true 会把这些文件改成 CRLF，导致 macOS 上
+# build-ipa.sh 报 "bad interpreter"、Xcode 解析 project.pbxproj 出问题。
+* text=auto eol=lf
+
+# Shell 脚本必须是 LF
+*.sh text eol=lf
+*.bash text eol=lf
+
+# 二进制文件不要做任何转换
+*.ipa binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.zip binary
+*.p12 binary
+*.mobileprovision binary
+
+# 工程/源码/配置文件统一 LF
+*.swift text eol=lf
+*.plist text eol=lf
+*.pbxproj text eol=lf
+*.xcscheme text eol=lf
+*.xcworkspacedata text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.md text eol=lf
+*.gitignore text eol=lf
+*.gitattributes text eol=lf
+
+# 语言统计时把生成的产物排除掉
+dist/** linguist-generated
