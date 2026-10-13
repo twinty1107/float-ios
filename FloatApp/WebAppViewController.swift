@@ -1,5 +1,6 @@
 import UIKit
 import WebKit
+import ObjectiveC
 
 /// Native WKWebView shell around https://meou123.netlify.app/
 /// Keeps the PWA inside the app, locks portrait, handles camera/mic uploads,
@@ -144,34 +145,63 @@ final class WebAppViewController: UIViewController, UIGestureRecognizerDelegate 
     // MARK: - 去掉键盘上方的输入助手栏
 
     /// WKWebView 会在键盘上方插入系统的 inputAssistantItem 栏
-    /// （上一个/下一个输入框的箭头 + “完成”按钮）。网页无法控制它，只能清空。
-    /// 代价：失去“上一个/下一个”快捷切换；键盘收起改用下拉与点按空白处。
+    /// （上一个/下一个输入框的箭头 + “完成”按钮）。网页无法控制它。
     ///
-    /// 时机很关键：WebKit 的内部视图是**懒创建**的，只在键盘要出现时才生成。
-    /// 所以除了加载完成时清一次，键盘通知回调里必须再清，并额外重试几拍，
-    /// 否则会漏掉“第一次弹键盘”这种情况（表现为第一次弹键盘仍有那条栏）。
-    private func stripInputAssistantBars(retries: Int = 3) {
+    /// 只清空 inputAssistantItem 的按钮组在很多 iOS 版本上不够——那条栏实际由
+    /// WKContentView 的 inputAccessoryView 提供。这里采用 react-native-webview 的做法
+    /// （RNCWebViewImpl.m）：运行时把 WKContentView 换成子类，让 inputAccessoryView 返回 nil，
+    /// 从根上把那整条栏去掉。
+    private func stripInputAssistantBars() {
         clearAssistantGroups(everywhereIn: webView)
-        clearAssistantGroups(everywhereIn: webView.scrollView)
-        guard retries > 0 else { return }
-        for delay in [0.05, 0.2, 0.5] {
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-                guard let self, let webView = self.webView else { return }
-                self.clearAssistantGroups(everywhereIn: webView)
-                self.clearAssistantGroups(everywhereIn: webView.scrollView)
-            }
-        }
+        hideFormAccessoryBar()
     }
 
     private func clearAssistantGroups(everywhereIn view: UIView) {
-        // 用 KVC 访问 inputAssistantItem：UIKit 未公开为协议要求，但所有 UIView 都响应
-        if let item = view.value(forKey: "inputAssistantItem") as? UITextInputAssistantItem {
+        // 先 responds(to:) 判断，避免对没有 inputAssistantItem 的内部视图做 KVC 而抛异常
+        if view.responds(to: NSSelectorFromString("inputAssistantItem")),
+           let item = view.value(forKey: "inputAssistantItem") as? UITextInputAssistantItem {
             item.leadingBarButtonGroups = []
             item.trailingBarButtonGroups = []
+            if #available(iOS 13.0, *) { item.allowsHidingShortcuts = true }
         }
         for sub in view.subviews {
             clearAssistantGroups(everywhereIn: sub)
         }
+    }
+
+    /// 找到 WKContentView（scrollView 里类名以 "WKContent" 开头的那个内部视图），
+    /// 动态建一个子类并覆盖 inputAccessoryView 返回 nil。
+    private func hideFormAccessoryBar() {
+        guard let scrollView = webView?.scrollView else { return }
+        hideFormAccessory(in: scrollView)
+    }
+
+    private func hideFormAccessory(in view: UIView) {
+        let className = String(describing: type(of: view))
+        if className.hasPrefix("WKContent"), !className.hasSuffix("_SwizzleHelperWK") {
+            swizzleInputAccessoryView(on: view)
+        }
+        for sub in view.subviews {
+            hideFormAccessory(in: sub)
+        }
+    }
+
+    private func swizzleInputAccessoryView(on view: UIView) {
+        let originalClass: AnyClass = type(of: view)
+        let subclassName = NSStringFromClass(originalClass) + "_SwizzleHelperWK"
+        if let existing = NSClassFromString(subclassName) {
+            object_setClass(view, existing)
+            return
+        }
+        guard let subclass = objc_allocateClassPair(originalClass, (subclassName as NSString).utf8String, 0) else {
+            return
+        }
+        typealias InputAccessoryBlock = @convention(block) (AnyObject) -> UIView?
+        let block: InputAccessoryBlock = { _ in nil }
+        let imp = imp_implementationWithBlock(block)
+        class_addMethod(subclass, NSSelectorFromString("inputAccessoryView"), imp, "@@:")
+        objc_registerClassPair(subclass)
+        object_setClass(view, subclass)
     }
 
     /// 访问 ?diag=1 时显示的自检面板：把 WebView 实际拿到的尺寸与安全区值摊开，
@@ -364,60 +394,62 @@ final class WebAppViewController: UIViewController, UIGestureRecognizerDelegate 
     /// 结果是整页被系统上推、输入框与键盘之间错位。改高度才会让网页自己重新排版。
     private func registerKeyboardObservers() {
         let center = NotificationCenter.default
-        // 同时监听 willChangeFrame 与 willShow/WillHide：
-        // 某些情况下 willChangeFrame 不触发（例如切换输入框），补上另两事件更稳。
-        for name in [UIResponder.keyboardWillChangeFrameNotification,
-                     UIResponder.keyboardWillShowNotification,
+        // 只用 willShow / willHide。willChangeFrame 会在一次弹键盘里触发多次，
+        // 与 WebKit 内部的滚动竞争，正是“整体顶上去再落下”的抖动来源。
+        for name in [UIResponder.keyboardWillShowNotification,
                      UIResponder.keyboardWillHideNotification] {
             let token = center.addObserver(forName: name, object: nil, queue: .main) { [weak self] note in
-                self?.keyboardFrameWillChange(note)
+                self?.keyboardWillShowHide(note)
             }
             keyboardObservers.append(token)
         }
     }
 
-    private func keyboardFrameWillChange(_ note: Notification) {
+    private func keyboardWillShowHide(_ note: Notification) {
         guard let webViewBottom else { return }
 
-        let duration = (note.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? NSNumber)?.doubleValue ?? 0.25
-        let curveRaw = (note.userInfo?[UIResponder.keyboardAnimationCurveUserInfoKey] as? NSNumber)?.uintValue
-            ?? UInt(UIView.AnimationCurve.easeInOut.rawValue)
-        let options = UIView.AnimationOptions(rawValue: curveRaw << 16)
-
         var overlap: CGFloat = 0
-        if note.name != UIResponder.keyboardWillHideNotification,
+        if note.name == UIResponder.keyboardWillShowNotification,
            let frameValue = note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? NSValue {
             let endFrame = frameValue.cgRectValue
-            // 键盘在屏幕外视为收起（外接键盘时 endFrame 会落到屏幕下方）
             if endFrame.minY < view.bounds.height {
-                let keyboardFrame = view.convert(endFrame, from: nil)
-                let safeBottom = view.safeAreaInsets.bottom
-                // 键盘高度扣掉安全区：否则键盘上方的 QuickType 条会被重复计算，
-                // 底部会多出一条空白（Capacitor 里就有 "Ignoring QuickType Bar" 这段处理）。
-                overlap = max(0, keyboardFrame.height - safeBottom)
+                // WebView 是全屏的：键盘顶到哪就缩到哪，完整高度不扣安全区
+                overlap = view.bounds.height - endFrame.minY
             }
         }
 
-        // 只在真的要收起时才滚动，避免收起键盘时页面跳动
-        let willShow = overlap > 0
-        view.layoutIfNeeded()
-        UIView.animate(withDuration: duration, delay: 0, options: options) {
+        // 同步调整、不带动画：与 WebKit 内部滚动同拍，避免“动画一样顶上去再落下”
+        UIView.performWithoutAnimation {
             webViewBottom.constant = -overlap
-            self.view.layoutIfNeeded()
-        } completion: { _ in
-            self.stripInputAssistantBars()
-            guard willShow else { return }
-            self.scrollActiveElementIntoView()
+            view.layoutIfNeeded()
+        }
+
+        if overlap > 0 {
+            // 若 WebKit 仍把整页滚上去（contentOffset 变负），拉回原位，保证顶栏纹丝不动
+            let sv = webView.scrollView
+            if sv.contentOffset.y < 0 {
+                sv.contentOffset = CGPoint(x: sv.contentOffset.x, y: 0)
+            }
+            stripInputAssistantBars()
+            // WKContentView 是懒创建的，延迟几拍再 swizzle，确保第一次弹键盘也不出现那条栏
+            for delay in [0.05, 0.2, 0.5] {
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                    self?.stripInputAssistantBars()
+                }
+            }
+            scrollActiveElementIntoView()
+        } else {
+            stripInputAssistantBars()
         }
     }
 
-    /// 键盘弹起后，把正在输入的控件滚进可视区
+    /// 键盘弹起后，把正在输入的控件滚进可视区（instant，不带动画避免二次跳动）
     private func scrollActiveElementIntoView() {
         webView.evaluateJavaScript("""
         (function () {
           var el = document.activeElement;
           if (el && typeof el.scrollIntoView === 'function') {
-            el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+            el.scrollIntoView({ block: 'center', behavior: 'auto' });
           }
         })();
         """, completionHandler: nil)
