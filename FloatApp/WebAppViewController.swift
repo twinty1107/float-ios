@@ -83,11 +83,13 @@ final class WebAppViewController: UIViewController, UIGestureRecognizerDelegate 
         // navigator.storage.persist()，而 WebKit 默认对普通 WKWebView 返回 false，
         // 于是那个开关永远打不开（站点会提示“浏览器未授予持久化保护”）。
         // 用 dataStoreForIdentifier 建一个命名的持久化数据存储，让 WebKit 认可该来源：
-        // 既让 persist() 有機會返回 true，也降低 iOS 长期未使用后回收站点数据的风险。
-        let dataStoreIdentifier = UUID(uuidString: "6B7A1C10-1F2E-4A55-9F3D-11C0DE5F10A7")!
-        if let store = WKWebsiteDataStore(forIdentifier: dataStoreIdentifier) {
-            configuration.websiteDataStore = store
+        // 既让 persist() 有机会返回 true，也降低 iOS 长期未使用后回收站点数据的风险。
+        // 注意：forIdentifier 是 iOS 17+ 的 API；返回值**不是** Optional，不能写 if let。
+        if #available(iOS 17.0, *) {
+            let dataStoreIdentifier = UUID(uuidString: "6B7A1C10-1F2E-4A55-9F3D-11C0DE5F10A7")!
+            configuration.websiteDataStore = WKWebsiteDataStore(forIdentifier: dataStoreIdentifier)
         }
+        // iOS 15/16 保持默认的持久化数据存储（.default()），行为与之前一致
 
         let userContentController = WKUserContentController()
         // 只补站点自己没处理的安全区（见 safeAreaCSS）。不覆盖站点原有的 viewport meta：
@@ -317,14 +319,20 @@ final class WebAppViewController: UIViewController, UIGestureRecognizerDelegate 
         errorLabel.textAlignment = .center
         errorLabel.translatesAutoresizingMaskIntoConstraints = false
 
-        let retry = UIButton(type: .system)
-        retry.setTitle("重新加载", for: .normal)
-        retry.setTitleColor(.label, for: .normal)
-        retry.titleLabel?.font = .systemFont(ofSize: 16, weight: .medium)
+        // 用 UIButton.Configuration 排版，避免 contentEdgeInsets 在 iOS 15 起的弃用警告
+        var config = UIButton.Configuration.plain()
+        config.title = "重新加载"
+        config.baseForegroundColor = .label
+        config.contentInsets = NSDirectionalEdgeInsets(top: 10, leading: 28, bottom: 10, trailing: 28)
+        config.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { incoming in
+            var outgoing = incoming
+            outgoing.font = .systemFont(ofSize: 16, weight: .medium)
+            return outgoing
+        }
+        let retry = UIButton(configuration: config)
         retry.layer.borderColor = UIColor.label.withAlphaComponent(0.35).cgColor
         retry.layer.borderWidth = 1
         retry.layer.cornerRadius = 22
-        retry.contentEdgeInsets = UIEdgeInsets(top: 10, left: 28, bottom: 10, right: 28)
         retry.addTarget(self, action: #selector(handleRefresh), for: .touchUpInside)
         retry.translatesAutoresizingMaskIntoConstraints = false
 
