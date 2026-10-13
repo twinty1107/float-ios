@@ -1,0 +1,232 @@
+name: Build unsigned iOS IPA
+
+# 在 GitHub 免费提供的 macOS runner 上编译 float 的 iOS 工程，
+# 产出一个「已编译但未签名」的 IPA，供你在 Windows 上用 ESign / Sideloadly 自签。
+on:
+  workflow_dispatch:
+    inputs:
+      bundle_id:
+        description: "Bundle ID（自签时若冲突可改，需与你的描述文件一致）"
+        required: false
+        default: "net.meou123.float"
+      signed:
+        description: "也尝试用证书签名（需先配置 6 个 Secrets，见 CI-SIGNING.md）"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build FloatApp.app
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    env:
+      SCHEME: FloatApp
+      PROJECT: FloatApp.xcodeproj
+      CONFIG: Release
+      BUNDLE_ID: ${{ inputs.bundle_id }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Toolchain info
+        run: |
+          xcodebuild -version
+          xcode-select -p
+          echo "--- available SDKs ---"
+          xcodebuild -showsdks | grep -i ios || true
+          echo "--- runner ---"
+          sysctl -n machdep.cpu.brand_string || true
+          echo "CPU 核心: $(sysctl -n hw.ncpu)"
+
+      - name: Preflight (项目结构校验)
+        run: |
+          set -euo pipefail
+          test -f FloatApp/AppDelegate.swift
+          test -f FloatApp/WebAppViewController.swift
+          test -f FloatApp/Info.plist
+          test -f FloatApp.xcodeproj/project.pbxproj
+          test -f FloatApp/Assets.xcassets/AppIcon.appiconset/AppIcon-1024.png
+          echo "工程文件齐全"
+
+          # 确认 xcodebuild 能识别工程与 scheme，否则提前给出人类可读的错误
+          xcodebuild -list -project "$PROJECT" || true
+          echo "--- 可用 scheme ---"
+          SCHEMES="$(xcodebuild -list -project "$PROJECT" 2>/dev/null | sed -n '/Schemes:/,$p' | tail -n +2 | xargs || true)"
+          echo "$SCHEMES"
+          case "$SCHEMES" in
+            *"$SCHEME"*) echo "scheme $SCHEME 已识别" ;;
+            *)
+              echo "::error::xcodebuild 未识别到 scheme '$SCHEME'（识别到: $SCHEMES）。请检查 FloatApp.xcodeproj/project.pbxproj 是否完整。"
+              exit 1
+              ;;
+          esac
+
+      - name: Build (no signing)
+        run: |
+          set -euo pipefail
+          # SUPPORTED_PLATFORMS=iphoneos：只编真机 arm64，不编模拟器切片，显著缩短耗时
+          # ONLY_ACTIVE_ARCH=NO：Release 下产出完整 arm64
+          xcodebuild \
+            -project "$PROJECT" \
+            -scheme "$SCHEME" \
+            -configuration "$CONFIG" \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
+            SUPPORTED_PLATFORMS=iphoneos \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Package unsigned IPA
+        id: pack
+        run: |
+          set -euo pipefail
+          APP="build/Build/Products/$CONFIG-iphoneos/$SCHEME.app"
+          test -d "$APP" || { echo "::error::未找到构建产物 $APP"; exit 1; }
+
+          # 关键校验：必须是真正编译出来的 arm64 可执行文件，而不是占位符
+          EXE="$APP/$SCHEME"
+          test -f "$EXE" || { echo "::error::缺少可执行文件 $EXE"; exit 1; }
+          SIZE=$(stat -f%z "$EXE")
+          echo "可执行文件大小: $SIZE bytes"
+          file "$EXE"
+          lipo -info "$EXE"
+          ARCHS=$(lipo -archs "$EXE")
+          echo "架构: $ARCHS"
+          case "$ARCHS" in *arm64*) ;; *) echo "::error::缺少 arm64 架构"; exit 1 ;; esac
+          if [ "$SIZE" -lt 100000 ]; then
+            echo "::error::可执行文件只有 $SIZE 字节，不像是真实编译产物"; exit 1
+          fi
+
+          VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist")
+          BUILD=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP/Info.plist")
+          NAME="float-${VERSION}-${BUILD}-unsigned"
+
+          # 打包成 IPA：ditto 生成 zip（Payload/ 位于归档根）。
+          # --norsrc 抑制 __MACOSX/AppleDouble 元数据，避免部分自签工具解析失败。
+          rm -rf pkg && mkdir -p pkg/Payload
+          cp -R "$APP" pkg/Payload/
+          /usr/bin/ditto -c -k --norsrc --keepParent pkg/Payload "$NAME.ipa"
+
+          ls -lh "$NAME.ipa"
+          echo "--- IPA 内可执行文件校验 ---"
+          unzip -l "$NAME.ipa"
+          rm -rf check && mkdir -p check
+          unzip -q "$NAME.ipa" -d check
+          IPA_EXE="check/Payload/$SCHEME.app/$SCHEME"
+          test -f "$IPA_EXE" || { echo "::error::IPA 内缺少可执行文件"; exit 1; }
+          IPA_SIZE=$(stat -f%z "$IPA_EXE")
+          echo "IPA 内可执行文件: $IPA_SIZE bytes, 架构 $(lipo -archs "$IPA_EXE")"
+          if [ "$IPA_SIZE" -lt 100000 ]; then
+            echo "::error::IPA 内可执行文件仅 $IPA_SIZE 字节，自签后会闪退"; exit 1
+          fi
+          if unzip -l "$NAME.ipa" | grep -q '__MACOSX'; then
+            echo "::error::IPA 含 __MACOSX 元数据"; exit 1
+          fi
+
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pack.outputs.name }}
+          path: ${{ steps.pack.outputs.name }}.ipa
+          if-no-files-found: error
+          retention-days: 30
+
+      # ---------------------------------------------------------------- 可选：带证书签名
+      - name: Prepare signing material
+        if: ${{ inputs.signed }}
+        env:
+          CERT_P12_B64: ${{ secrets.IOS_CERT_P12_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.IOS_CERT_PASSWORD }}
+          PROVISION_B64: ${{ secrets.IOS_PROVISION_BASE64 }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CERT_P12_B64:-}" ] || [ -z "${PROVISION_B64:-}" ]; then
+            echo "::error::inputs.signed=true 但缺少 IOS_CERT_P12_BASE64 / IOS_PROVISION_BASE64 / IOS_CERT_PASSWORD Secrets"
+            exit 1
+          fi
+          KEYCHAIN="$RUNNER_TEMP/sign.keychain-db"
+          KC_PASS="ci-float-$(date +%s)"
+          # 系统 base64 是 BSD 版：解码用 -D（不是 --decode）
+          echo "$CERT_P12_B64" | base64 -D -o "$RUNNER_TEMP/cert.p12"
+          echo "$PROVISION_B64" | base64 -D -o "$RUNNER_TEMP/profile.mobileprovision"
+          test -s "$RUNNER_TEMP/cert.p12" || { echo "::error::cert.p12 解码为空"; exit 1; }
+          test -s "$RUNNER_TEMP/profile.mobileprovision" || { echo "::error::描述文件解码为空"; exit 1; }
+          security create-keychain -p "$KC_PASS" "$KEYCHAIN"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN"
+          security unlock-keychain -p "$KC_PASS" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$CERT_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KC_PASS" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          security find-identity -v -p codesigning "$KEYCHAIN"
+          {
+            echo "KEYCHAIN=$KEYCHAIN"
+            echo "KC_PASS=$KC_PASS"
+          } >> "$GITHUB_ENV"
+
+      - name: Sign and repackage
+        if: ${{ inputs.signed }}
+        env:
+          TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          APP="build/Build/Products/$CONFIG-iphoneos/$SCHEME.app"
+          security cms -D -i "$RUNNER_TEMP/profile.mobileprovision" > "$RUNNER_TEMP/profile.plist"
+          /usr/libexec/PlistBuddy -x -c 'Print :Entitlements' "$RUNNER_TEMP/profile.plist" > "$RUNNER_TEMP/entitlements.plist"
+          cp "$RUNNER_TEMP/profile.mobileprovision" "$APP/embedded.mobileprovision"
+
+          IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN" | awk 'NR==1{print $2}')
+          test -n "$IDENTITY" || { echo "::error::keychain 内无可用签名身份"; exit 1; }
+
+          # 先签嵌套的 framework / dylib，再签主包
+          # 用 xargs 而非进程替换，避免 YAML 块标量里出现 < 引发解析歧义
+          find "$APP" \( -name '*.framework' -o -name '*.dylib' \) -print0 2>/dev/null \
+            | xargs -0 -n1 codesign --force --sign "$IDENTITY" --timestamp=none
+          codesign --force --sign "$IDENTITY" \
+            --entitlements "$RUNNER_TEMP/entitlements.plist" \
+            --timestamp=none "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+
+          VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist")
+          NAME="float-${VERSION}-signed"
+          rm -rf pkg-signed && mkdir -p pkg-signed/Payload
+          cp -R "$APP" pkg-signed/Payload/
+          /usr/bin/ditto -c -k --norsrc --keepParent pkg-signed/Payload "$NAME.ipa"
+
+          echo "SIGNED_NAME=$NAME" >> "$GITHUB_ENV"
+
+      - name: Upload signed IPA
+        if: ${{ inputs.signed }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.SIGNED_NAME }}
+          path: ${{ env.SIGNED_NAME }}.ipa
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Summary
+        run: |
+          {
+            echo "### 构建完成"
+            echo ""
+            echo "- 未签名 IPA：\`${{ steps.pack.outputs.name }}.ipa\`（下载后自签安装）"
+            if [ "${{ inputs.signed }}" = "true" ]; then
+              echo "- 已签名 IPA：\`${{ env.SIGNED_NAME }}.ipa\`"
+            fi
+            echo ""
+            echo "Bundle ID：\`$BUNDLE_ID\`"
+          } >> "$GITHUB_STEP_SUMMARY"
