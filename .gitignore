@@ -1,0 +1,29 @@
+# Xcode / 构建产物
+build/
+DerivedData/
+*.xcarchive
+*.xcuserstate
+xcuserdata/
+*.moved-aside
+*.hmap
+*.ipa.tmp
+
+# 打包中间目录（脚本运行时生成的）
+pkg/
+pkg-signed/
+check/
+export/
+
+# 本仓库里 dist/ 只保留 Windows 上生成的未签名骨架
+# CI 和 macOS 脚本产出的真 IPA 不进版本库
+dist/float-*.ipa
+!dist/float-unsigned.ipa
+
+# macOS
+.DS_Store
+._*
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
