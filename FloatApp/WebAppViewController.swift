@@ -28,6 +28,7 @@ final class WebAppViewController: UIViewController, UIGestureRecognizerDelegate 
     private let errorLabel = UILabel()
 
     private var progressObservation: NSKeyValueObservation?
+    private var contentOffsetObservation: NSKeyValueObservation?
     private var keyboardObservers: [NSObjectProtocol] = []
     private var didFinishFirstLoad = false
 
@@ -47,6 +48,7 @@ final class WebAppViewController: UIViewController, UIGestureRecognizerDelegate 
     deinit {
         keyboardObservers.forEach { NotificationCenter.default.removeObserver($0) }
         progressObservation?.invalidate()
+        contentOffsetObservation?.invalidate()
     }
 
     override var preferredStatusBarStyle: UIStatusBarStyle {
@@ -109,7 +111,9 @@ final class WebAppViewController: UIViewController, UIGestureRecognizerDelegate 
         // .never：安全区交给页面自己用 env(safe-area-inset-*) 处理。
         // 若用 .always，系统会以浏览器方式再加一次顶部留白，与站点的 cover 布局冲突。
         webView.scrollView.contentInsetAdjustmentBehavior = .never
-        webView.scrollView.bounces = true
+        // 关闭橡皮筋回弹：键盘弹出时 WebKit 会把 contentOffset 拉到负值导致"整页上移"，
+        // bounces=false 直接掐掉这个弹性动画，顶栏不再跟着弹。
+        webView.scrollView.bounces = false
         webView.scrollView.keyboardDismissMode = .interactive
         webView.isOpaque = true
         webView.backgroundColor = Config.background
@@ -133,10 +137,13 @@ final class WebAppViewController: UIViewController, UIGestureRecognizerDelegate 
             self?.updateProgress(Float(webView.estimatedProgress))
         }
 
-        let refresh = UIRefreshControl()
-        refresh.tintColor = .secondaryLabel
-        refresh.addTarget(self, action: #selector(handleRefresh), for: .valueChanged)
-        webView.scrollView.refreshControl = refresh
+        // 站点是固定布局（顶栏/输入栏 fixed，内容区内部滚动），主 scrollView 永远不该有负偏移。
+        // 键盘/focus 时 WebKit 会把 offset 拉到负值造成"整页上移"，这里强制拉回 0。
+        contentOffsetObservation = webView.scrollView.observe(\.contentOffset, options: [.new]) { scrollView, _ in
+            if scrollView.contentOffset.y < 0 {
+                scrollView.contentOffset = CGPoint(x: scrollView.contentOffset.x, y: 0)
+            }
+        }
 
         stripInputAssistantBars()
         installTapToDismissKeyboard()
@@ -438,22 +445,11 @@ final class WebAppViewController: UIViewController, UIGestureRecognizerDelegate 
                     self?.stripInputAssistantBars()
                 }
             }
-            scrollActiveElementIntoView()
+            // 不再手动 scrollIntoView：站点自己有 visualViewport/ResizeObserver 的滚动同步逻辑，
+            // 手动滚只会和它打架，造成"上移回弹"。
         } else {
             stripInputAssistantBars()
         }
-    }
-
-    /// 键盘弹起后，把正在输入的控件滚进可视区（instant，不带动画避免二次跳动）
-    private func scrollActiveElementIntoView() {
-        webView.evaluateJavaScript("""
-        (function () {
-          var el = document.activeElement;
-          if (el && typeof el.scrollIntoView === 'function') {
-            el.scrollIntoView({ block: 'center', behavior: 'auto' });
-          }
-        })();
-        """, completionHandler: nil)
     }
 
     // MARK: - 点按空白处收起键盘
