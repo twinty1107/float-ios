@@ -79,6 +79,16 @@ final class WebAppViewController: UIViewController, UIGestureRecognizerDelegate 
             configuration.defaultWebpagePreferences.preferredContentMode = .mobile
         }
 
+        // 站点设置里有“浏览器持久化保护”开关，它调用的是 Web 标准
+        // navigator.storage.persist()，而 WebKit 默认对普通 WKWebView 返回 false，
+        // 于是那个开关永远打不开（站点会提示“浏览器未授予持久化保护”）。
+        // 用 dataStoreForIdentifier 建一个命名的持久化数据存储，让 WebKit 认可该来源：
+        // 既让 persist() 有機會返回 true，也降低 iOS 长期未使用后回收站点数据的风险。
+        let dataStoreIdentifier = UUID(uuidString: "6B7A1C10-1F2E-4A55-9F3D-11C0DE5F10A7")!
+        if let store = WKWebsiteDataStore(forIdentifier: dataStoreIdentifier) {
+            configuration.websiteDataStore = store
+        }
+
         let userContentController = WKUserContentController()
         // 只补站点自己没处理的安全区（见 safeAreaCSS）。不覆盖站点原有的 viewport meta：
         // 它已经声明了 viewport-fit=cover，按 cover 模式渲染才能正确撑满刘海与底部横条。
