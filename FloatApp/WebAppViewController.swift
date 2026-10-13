@@ -28,7 +28,6 @@ final class WebAppViewController: UIViewController, UIGestureRecognizerDelegate 
     private let errorLabel = UILabel()
 
     private var progressObservation: NSKeyValueObservation?
-    private var contentOffsetObservation: NSKeyValueObservation?
     private var keyboardObservers: [NSObjectProtocol] = []
     private var didFinishFirstLoad = false
 
@@ -48,7 +47,6 @@ final class WebAppViewController: UIViewController, UIGestureRecognizerDelegate 
     deinit {
         keyboardObservers.forEach { NotificationCenter.default.removeObserver($0) }
         progressObservation?.invalidate()
-        contentOffsetObservation?.invalidate()
     }
 
     override var preferredStatusBarStyle: UIStatusBarStyle {
@@ -111,9 +109,7 @@ final class WebAppViewController: UIViewController, UIGestureRecognizerDelegate 
         // .never：安全区交给页面自己用 env(safe-area-inset-*) 处理。
         // 若用 .always，系统会以浏览器方式再加一次顶部留白，与站点的 cover 布局冲突。
         webView.scrollView.contentInsetAdjustmentBehavior = .never
-        // 关闭橡皮筋回弹：键盘弹出时 WebKit 会把 contentOffset 拉到负值导致"整页上移"，
-        // bounces=false 直接掐掉这个弹性动画，顶栏不再跟着弹。
-        webView.scrollView.bounces = false
+        webView.scrollView.bounces = true
         webView.scrollView.keyboardDismissMode = .interactive
         webView.isOpaque = true
         webView.backgroundColor = Config.background
@@ -137,13 +133,10 @@ final class WebAppViewController: UIViewController, UIGestureRecognizerDelegate 
             self?.updateProgress(Float(webView.estimatedProgress))
         }
 
-        // 站点是固定布局（顶栏/输入栏 fixed，内容区内部滚动），主 scrollView 永远不该有负偏移。
-        // 键盘/focus 时 WebKit 会把 offset 拉到负值造成"整页上移"，这里强制拉回 0。
-        contentOffsetObservation = webView.scrollView.observe(\.contentOffset, options: [.new]) { scrollView, _ in
-            if scrollView.contentOffset.y < 0 {
-                scrollView.contentOffset = CGPoint(x: scrollView.contentOffset.x, y: 0)
-            }
-        }
+        let refresh = UIRefreshControl()
+        refresh.tintColor = .secondaryLabel
+        refresh.addTarget(self, action: #selector(handleRefresh), for: .valueChanged)
+        webView.scrollView.refreshControl = refresh
 
         stripInputAssistantBars()
         installTapToDismissKeyboard()
@@ -433,11 +426,11 @@ final class WebAppViewController: UIViewController, UIGestureRecognizerDelegate 
         }
 
         if overlap > 0 {
-            // 若 WebKit 仍把整页滚上去（contentOffset 变负），拉回原位，保证顶栏纹丝不动
-            let sv = webView.scrollView
-            if sv.contentOffset.y < 0 {
-                sv.contentOffset = CGPoint(x: sv.contentOffset.x, y: 0)
-            }
+            // 锁死顶栏：键盘/聚焦期间 WebKit 会把主 scrollView 的 contentOffset 拉到负值，
+            // 那会把整个画面（含顶栏）往上推。这里在键盘动画期间分几拍把偏移摁回 0。
+            // 用"延迟几次拉回"而不是 KVO 持续拦截——后者会不断打断站点自己的滚动同步，
+            // 导致输入栏错位、页面大片空白（0.1.2 就是这么翻车的）。
+            lockTopEdge()
             stripInputAssistantBars()
             // WKContentView 是懒创建的，延迟几拍再 swizzle，确保第一次弹键盘也不出现那条栏
             for delay in [0.05, 0.2, 0.5] {
@@ -445,10 +438,25 @@ final class WebAppViewController: UIViewController, UIGestureRecognizerDelegate 
                     self?.stripInputAssistantBars()
                 }
             }
-            // 不再手动 scrollIntoView：站点自己有 visualViewport/ResizeObserver 的滚动同步逻辑，
-            // 手动滚只会和它打架，造成"上移回弹"。
+            // 不手动 scrollIntoView：站点自己有 visualViewport/ResizeObserver 的滚动同步逻辑，
+            // 手动滚只会和它打架（这正是之前"上移回弹"的来源）。
         } else {
             stripInputAssistantBars()
+        }
+    }
+
+    /// 把主 scrollView 的顶部偏移摁回 0（只在键盘出现的短窗口内做几次，不长期挂 KVO）
+    private func lockTopEdge() {
+        guard webView?.scrollView != nil else { return }
+        func clamp() {
+            guard let scrollView = webView?.scrollView else { return }
+            if scrollView.contentOffset.y < 0 {
+                scrollView.contentOffset = CGPoint(x: scrollView.contentOffset.x, y: 0)
+            }
+        }
+        clamp()
+        for delay in [0.03, 0.08, 0.16, 0.28, 0.45] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { clamp() }
         }
     }
 
