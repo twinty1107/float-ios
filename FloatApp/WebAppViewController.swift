@@ -12,7 +12,8 @@ final class WebAppViewController: UIViewController {
         static let startURL = URL(string: "https://meou123.netlify.app/")!
         /// Hosts allowed to stay inside the app; everything else opens in Safari.
         static let inAppHosts: Set<String> = ["meou123.netlify.app"]
-        static let backgroundColor = UIColor.black
+        /// 站点主题色 #f8f7f2：用它当底色，页面未铺满时才不会露出黑边。
+        static let background = UIColor(red: 0xF8 / 255.0, green: 0xF7 / 255.0, blue: 0xF2 / 255.0, alpha: 1)
     }
 
     // MARK: - Views
@@ -24,22 +25,30 @@ final class WebAppViewController: UIViewController {
     private let errorLabel = UILabel()
 
     private var progressObservation: NSKeyValueObservation?
+    private var keyboardObservers: [NSObjectProtocol] = []
     private var didFinishFirstLoad = false
 
     // MARK: - Lifecycle
 
     override func viewDidLoad() {
         super.viewDidLoad()
-        view.backgroundColor = Config.backgroundColor
+        view.backgroundColor = Config.background
         configureWebView()
         configureProgressBar()
         configureSplash()
         configureErrorView()
+        registerKeyboardObservers()
         loadStartPage()
     }
 
+    deinit {
+        keyboardObservers.forEach { NotificationCenter.default.removeObserver($0) }
+        progressObservation?.invalidate()
+    }
+
     override var preferredStatusBarStyle: UIStatusBarStyle {
-        didFinishFirstLoad ? .default : .lightContent
+        // 站点是浅色主题（#f8f7f2），状态栏用深色文字
+        .darkContent
     }
 
     override var supportedInterfaceOrientations: UIInterfaceOrientationMask { .portrait }
@@ -56,20 +65,10 @@ final class WebAppViewController: UIViewController {
         }
 
         let userContentController = WKUserContentController()
-        // Viewport guard: keeps the PWA edge-to-edge under the notch / home indicator.
-        let viewportScript = """
-        (function () {
-          var meta = document.querySelector('meta[name="viewport"]');
-          if (!meta) {
-            meta = document.createElement('meta');
-            meta.setAttribute('name', 'viewport');
-            document.head.appendChild(meta);
-          }
-          meta.setAttribute('content', 'width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover, user-scalable=no');
-        })();
-        """
-        userContentController.addUserScript(WKUserScript(source: viewportScript,
-                                                        injectionTime: .atDocumentStart,
+        // 只补站点自己没处理的安全区（见 safeAreaCSS）。不覆盖站点原有的 viewport meta：
+        // 它已经声明了 viewport-fit=cover，按 cover 模式渲染才能正确撑满刘海与底部横条。
+        userContentController.addUserScript(WKUserScript(source: Self.safeAreaCSS,
+                                                        injectionTime: .atDocumentEnd,
                                                         forMainFrameOnly: true))
         configuration.userContentController = userContentController
 
@@ -77,11 +76,14 @@ final class WebAppViewController: UIViewController {
         webView.navigationDelegate = self
         webView.uiDelegate = self
         webView.allowsBackForwardNavigationGestures = true
-        webView.scrollView.contentInsetAdjustmentBehavior = .always
+        // .never：安全区交给页面自己用 env(safe-area-inset-*) 处理。
+        // 若用 .always，系统会以浏览器方式再加一次顶部留白，与站点的 cover 布局冲突。
+        webView.scrollView.contentInsetAdjustmentBehavior = .never
         webView.scrollView.bounces = true
+        webView.scrollView.keyboardDismissMode = .interactive
         webView.isOpaque = true
-        webView.backgroundColor = Config.backgroundColor
-        webView.scrollView.backgroundColor = Config.backgroundColor
+        webView.backgroundColor = Config.background
+        webView.scrollView.backgroundColor = Config.background
         if #available(iOS 16.4, *) {
             webView.isInspectable = true
         }
@@ -100,13 +102,59 @@ final class WebAppViewController: UIViewController {
         }
 
         let refresh = UIRefreshControl()
-        refresh.tintColor = .white
+        refresh.tintColor = .secondaryLabel
         refresh.addTarget(self, action: #selector(handleRefresh), for: .valueChanged)
         webView.scrollView.refreshControl = refresh
     }
 
+    /// 安全区兜底：站点若已用 env(safe-area-inset-*) 自行避让，这里什么都不做；
+    /// 若没有，则把内容推进安全区，避免标题被灵动岛压住、底部被横条遮挡。
+    private static let safeAreaCSS = """
+    (function () {
+      var d = document, de = d.documentElement;
+      var root = getComputedStyle(de);
+      var readInset = function (name) {
+        var probe = d.createElement('div');
+        probe.style.cssText = 'position:fixed;visibility:hidden;pointer-events:none;height:env(' + name + ',0px)';
+        de.appendChild(probe);
+        var v = parseFloat(getComputedStyle(probe).height) || 0;
+        de.removeChild(probe);
+        return v;
+      };
+      var top = readInset('safe-area-inset-top');
+      var bottom = readInset('safe-area-inset-bottom');
+      var handlesTop = false, handlesBottom = false, el = d.body;
+      while (el && el !== de) {
+        var cs = getComputedStyle(el);
+        var padTop = parseFloat(cs.paddingTop) || 0;
+        var padBottom = parseFloat(cs.paddingBottom) || 0;
+        var posTop = parseFloat(cs.top) || 0;
+        var marginTop = parseFloat(cs.marginTop) || 0;
+        if (top > 0 && (padTop >= top - 1 || (cs.position === 'fixed' && posTop >= top - 1) || marginTop >= top - 1)) handlesTop = true;
+        if (bottom > 0 && padBottom >= bottom - 1) handlesBottom = true;
+        el = el.parentElement;
+      }
+      var bodyCS = d.body ? getComputedStyle(d.body) : null;
+      var bg = (bodyCS && bodyCS.backgroundColor && bodyCS.backgroundColor !== 'rgba(0, 0, 0, 0)')
+        ? bodyCS.backgroundColor
+        : (root.backgroundColor !== 'rgba(0, 0, 0, 0)' ? root.backgroundColor : '#f8f7f2');
+      de.style.background = bg;
+      if (!handlesTop && top > 0) de.style.paddingTop = top + 'px';
+      if (!handlesBottom && bottom > 0) de.style.paddingBottom = bottom + 'px';
+    })();
+    """
+
+    /// 页面若把宽度算得超出可视区，锁回 1.0（maximum-scale=1 之外的第二道保险）。
+    private func lockZoomScale() {
+        guard let scrollView = webView?.scrollView else { return }
+        if abs(scrollView.zoomScale - 1) > 0.001 {
+            scrollView.setZoomScale(1, animated: false)
+        }
+        scrollView.contentOffset.x = 0
+    }
+
     private func configureProgressBar() {
-        progressBar.progressTintColor = .white
+        progressBar.progressTintColor = .secondaryLabel
         progressBar.trackTintColor = .clear
         progressBar.alpha = 0
         progressBar.translatesAutoresizingMaskIntoConstraints = false
@@ -120,17 +168,17 @@ final class WebAppViewController: UIViewController {
     }
 
     private func configureSplash() {
-        splashView.backgroundColor = Config.backgroundColor
+        splashView.backgroundColor = Config.background
         splashView.translatesAutoresizingMaskIntoConstraints = false
 
         let title = UILabel()
         title.text = "float"
-        title.textColor = .white
+        title.textColor = .darkGray
         title.font = .systemFont(ofSize: 34, weight: .light)
         title.translatesAutoresizingMaskIntoConstraints = false
 
         let spinner = UIActivityIndicatorView(style: .medium)
-        spinner.color = .white
+        spinner.color = .darkGray
         spinner.startAnimating()
         spinner.translatesAutoresizingMaskIntoConstraints = false
 
@@ -151,13 +199,13 @@ final class WebAppViewController: UIViewController {
     }
 
     private func configureErrorView() {
-        errorView.backgroundColor = Config.backgroundColor
+        errorView.backgroundColor = Config.background
         errorView.alpha = 0
         errorView.isUserInteractionEnabled = false
         errorView.translatesAutoresizingMaskIntoConstraints = false
 
         errorLabel.text = "网络未连接\n请检查网络后重试"
-        errorLabel.textColor = UIColor.white.withAlphaComponent(0.85)
+        errorLabel.textColor = UIColor.label.withAlphaComponent(0.85)
         errorLabel.font = .systemFont(ofSize: 16, weight: .regular)
         errorLabel.numberOfLines = 0
         errorLabel.textAlignment = .center
@@ -165,9 +213,9 @@ final class WebAppViewController: UIViewController {
 
         let retry = UIButton(type: .system)
         retry.setTitle("重新加载", for: .normal)
-        retry.setTitleColor(.white, for: .normal)
+        retry.setTitleColor(.label, for: .normal)
         retry.titleLabel?.font = .systemFont(ofSize: 16, weight: .medium)
-        retry.layer.borderColor = UIColor.white.withAlphaComponent(0.4).cgColor
+        retry.layer.borderColor = UIColor.label.withAlphaComponent(0.35).cgColor
         retry.layer.borderWidth = 1
         retry.layer.cornerRadius = 22
         retry.contentEdgeInsets = UIEdgeInsets(top: 10, left: 28, bottom: 10, right: 28)
@@ -188,6 +236,55 @@ final class WebAppViewController: UIViewController {
             retry.centerXAnchor.constraint(equalTo: errorView.centerXAnchor),
             retry.topAnchor.constraint(equalTo: errorLabel.bottomAnchor, constant: 28)
         ])
+    }
+
+    // MARK: - Keyboard avoidance
+
+    /// 键盘避让：把键盘占掉的高度加进 scrollView 的底部 inset，
+    /// 让 WebKit 知道可视区变小并在文档流内滚动焦点元素，
+    /// 而不是把整个页面顶上去（原来没有这段逻辑，所以键盘一弹整页上移）。
+    private func registerKeyboardObservers() {
+        let center = NotificationCenter.default
+        for name in [UIResponder.keyboardWillChangeFrameNotification,
+                     UIResponder.keyboardWillHideNotification] {
+            let token = center.addObserver(forName: name, object: nil, queue: .main) { [weak self] note in
+                self?.keyboardWillChange(note)
+            }
+            keyboardObservers.append(token)
+        }
+    }
+
+    private func keyboardWillChange(_ note: Notification) {
+        guard let webView else { return }
+        let duration = (note.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? NSNumber)?.doubleValue ?? 0.25
+        let curveRaw = (note.userInfo?[UIResponder.keyboardAnimationCurveUserInfoKey] as? NSNumber)?.uintValue
+            ?? UInt(UIView.AnimationCurve.easeInOut.rawValue)
+        let options = UIView.AnimationOptions(rawValue: curveRaw << 16)
+
+        var inset: CGFloat = 0
+        if note.name != UIResponder.keyboardWillHideNotification,
+           let frameValue = note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? NSValue {
+            let keyboardFrame = view.convert(frameValue.cgRectValue, from: nil)
+            // 键盘与 webView 的重叠高度
+            inset = max(0, webView.frame.maxY - keyboardFrame.minY)
+        }
+
+        UIView.animate(withDuration: duration, delay: 0, options: options) {
+            webView.scrollView.contentInset.bottom = inset
+            webView.scrollView.verticalScrollIndicatorInsets.bottom = inset
+        } completion: { _ in
+            if inset > 0 {
+                // 键盘完全展开后，把正在输入的控件滚进可视区
+                webView.evaluateJavaScript("""
+                (function () {
+                  var el = document.activeElement;
+                  if (el && typeof el.scrollIntoView === 'function') {
+                    el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+                  }
+                })();
+                """, completionHandler: nil)
+            }
+        }
     }
 
     // MARK: - Loading
@@ -300,6 +397,10 @@ extension WebAppViewController: WKNavigationDelegate {
         hideSplash()
         hideError()
         webView.scrollView.refreshControl?.endRefreshing()
+        // 页面稳定后复位缩放并检查安全区（SPA 内容由 JS 渲染，需要等一拍）
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+            self?.lockZoomScale()
+        }
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
