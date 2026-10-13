@@ -80,7 +80,9 @@ final class WebAppViewController: UIViewController, UIGestureRecognizerDelegate 
         let userContentController = WKUserContentController()
         // 只补站点自己没处理的安全区（见 safeAreaCSS）。不覆盖站点原有的 viewport meta：
         // 它已经声明了 viewport-fit=cover，按 cover 模式渲染才能正确撑满刘海与底部横条。
-        userContentController.addUserScript(WKUserScript(source: Self.safeAreaCSS,
+        let script = Self.safeAreaCSS.replacingOccurrences(of: "__DIAG_OVERLAY__",
+                                                          with: Self.diagnosticOverlayJS)
+        userContentController.addUserScript(WKUserScript(source: script,
                                                         injectionTime: .atDocumentEnd,
                                                         forMainFrameOnly: true))
         configuration.userContentController = userContentController
@@ -146,40 +148,81 @@ final class WebAppViewController: UIViewController, UIGestureRecognizerDelegate 
         }
     }
 
-    /// 安全区兜底：站点若已用 env(safe-area-inset-*) 自行避让，这里什么都不做；
-    /// 若没有，则把内容推进安全区，避免标题被灵动岛压住、底部被横条遮挡。
+    /// 访问 ?diag=1 时显示的自检面板：把 WebView 实际拿到的尺寸与安全区值摊开，
+    /// 便于判断“显示异常”到底是页面自己算错，还是原生壳给错了环境。
+    private static let diagnosticOverlayJS = """
+    (function () {
+      if (d.getElementById('dsh-diag-panel')) return;
+      var rows = [
+        ['view inner', info.innerWidth + ' x ' + info.innerHeight],
+        ['screen', info.screenWidth + ' x ' + info.screenHeight + '  dpr ' + info.devicePixelRatio],
+        ['safe-area top/bottom', info.safeAreaTop + ' / ' + info.safeAreaBottom],
+        ['safe-area left/right', info.safeAreaLeft + ' / ' + info.safeAreaRight],
+        ['.app-root padding-top', String(info.appRootPaddingTop)],
+        ['.app-root margin-top', String(info.appRootMarginTop)],
+        ['standalone MQ', String(info.standaloneMQ)],
+        ['navigator.standalone', String(info.navigatorStandalone)],
+        ['data-pwa-display-mode', String(info.pwaDisplayModeAttr)]
+      ];
+      var box = d.createElement('div');
+      box.id = 'dsh-diag-panel';
+      box.style.cssText = 'position:fixed;left:8px;right:8px;bottom:8px;z-index:2147483647;'
+        + 'background:rgba(20,20,20,.92);color:#fff;font:11px/1.5 ui-monospace,Menlo,monospace;'
+        + 'padding:10px 12px;border-radius:12px;max-height:52vh;overflow:auto;-webkit-user-select:text;user-select:text';
+      var html = '<div style="font-weight:700;margin-bottom:6px">float shell 自检 (?diag=1)</div>';
+      for (var i = 0; i < rows.length; i++) {
+        html += '<div><span style="opacity:.6">' + rows[i][0] + ':</span> ' + rows[i][1] + '</div>';
+      }
+      html += '<div style="margin-top:8px;opacity:.75;word-break:break-all">' + info.ua + '</div>';
+      html += '<div style="margin-top:8px"><button id="dsh-diag-close" style="padding:6px 14px;'
+        + 'border-radius:16px;border:0;background:#fff;color:#111;font-size:12px">关闭</button></div>';
+      box.innerHTML = html;
+      d.body.appendChild(box);
+      d.getElementById('dsh-diag-close').addEventListener('click', function () { box.remove(); });
+    })();
+    """
+
+    /// 只测量、不改动布局。
+    /// 实测站点 CSS 自己就用了 36 处 env(safe-area-inset-top) 和 145 处 env(safe-area-inset-bottom)，
+    /// 还写了 max(48px, env(...)) 这类兜底，所以原生侧再补内边距只会和它打架、
+    /// 并打乱 100dvh / position:fixed 的算式。这里改为只把测量值写进 DOM 便于排查。
     private static let safeAreaCSS = """
     (function () {
-      var d = document, de = d.documentElement;
-      var root = getComputedStyle(de);
-      var readInset = function (name) {
-        var probe = d.createElement('div');
-        probe.style.cssText = 'position:fixed;visibility:hidden;pointer-events:none;height:env(' + name + ',0px)';
-        de.appendChild(probe);
-        var v = parseFloat(getComputedStyle(probe).height) || 0;
-        de.removeChild(probe);
-        return v;
-      };
-      var top = readInset('safe-area-inset-top');
-      var bottom = readInset('safe-area-inset-bottom');
-      var handlesTop = false, handlesBottom = false, el = d.body;
-      while (el && el !== de) {
-        var cs = getComputedStyle(el);
-        var padTop = parseFloat(cs.paddingTop) || 0;
-        var padBottom = parseFloat(cs.paddingBottom) || 0;
-        var posTop = parseFloat(cs.top) || 0;
-        var marginTop = parseFloat(cs.marginTop) || 0;
-        if (top > 0 && (padTop >= top - 1 || (cs.position === 'fixed' && posTop >= top - 1) || marginTop >= top - 1)) handlesTop = true;
-        if (bottom > 0 && padBottom >= bottom - 1) handlesBottom = true;
-        el = el.parentElement;
-      }
-      var bodyCS = d.body ? getComputedStyle(d.body) : null;
-      var bg = (bodyCS && bodyCS.backgroundColor && bodyCS.backgroundColor !== 'rgba(0, 0, 0, 0)')
-        ? bodyCS.backgroundColor
-        : (root.backgroundColor !== 'rgba(0, 0, 0, 0)' ? root.backgroundColor : '#f8f7f2');
-      de.style.background = bg;
-      if (!handlesTop && top > 0) de.style.paddingTop = top + 'px';
-      if (!handlesBottom && bottom > 0) de.style.paddingBottom = bottom + 'px';
+      try {
+        var d = document, de = d.documentElement;
+        var readInset = function (name) {
+          var probe = d.createElement('div');
+          probe.style.cssText = 'position:fixed;visibility:hidden;pointer-events:none;height:env(' + name + ',0px)';
+          de.appendChild(probe);
+          var v = parseFloat(getComputedStyle(probe).height) || 0;
+          de.removeChild(probe);
+          return v;
+        };
+        var top = readInset('safe-area-inset-top');
+        var bottom = readInset('safe-area-inset-bottom');
+        var left = readInset('safe-area-inset-left');
+        var right = readInset('safe-area-inset-right');
+        var appRoot = d.querySelector('main.app-root, .app-root, #__next > *') || d.body;
+        var info = {
+          safeAreaTop: top, safeAreaBottom: bottom, safeAreaLeft: left, safeAreaRight: right,
+          appRootPaddingTop: appRoot ? getComputedStyle(appRoot).paddingTop : null,
+          appRootMarginTop: appRoot ? getComputedStyle(appRoot).marginTop : null,
+          innerWidth: window.innerWidth, innerHeight: window.innerHeight,
+          devicePixelRatio: window.devicePixelRatio,
+          screenWidth: screen.width, screenHeight: screen.height,
+          standaloneMQ: window.matchMedia('(display-mode: standalone)').matches,
+          minimalUiMQ: window.matchMedia('(display-mode: minimal-ui)').matches,
+          navigatorStandalone: window.navigator.standalone,
+          pwaDisplayModeAttr: de.getAttribute('data-pwa-display-mode'),
+          viewportMeta: (d.querySelector('meta[name=viewport]') || {}).content,
+          ua: navigator.userAgent
+        };
+        de.setAttribute('data-dsh-diag', JSON.stringify(info));
+        if (window.console && console.log) {
+          console.log('[float-shell] diagnostics', JSON.stringify(info, null, 1));
+        }
+        if (/[?&]diag=1/.test(location.search)) { __DIAG_OVERLAY__ }
+      } catch (e) {}
     })();
     """
 
@@ -293,6 +336,10 @@ final class WebAppViewController: UIViewController, UIGestureRecognizerDelegate 
         }
     }
 
+    /// 键盘避让。
+    /// 关键点：不能无条件加 contentInset.bottom —— WebKit 自己也会缩一次可视区，
+    /// 两边同时做会在页面底部留下一条永久空白。所以先量一下页面可视高度有没有自己变小：
+    /// 变小了说明 WebKit 已处理，这里就不加；没变小才由原生补 inset。
     private func keyboardWillChange(_ note: Notification) {
         guard let webView else { return }
         let duration = (note.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? NSNumber)?.doubleValue ?? 0.25
@@ -300,31 +347,49 @@ final class WebAppViewController: UIViewController, UIGestureRecognizerDelegate 
             ?? UInt(UIView.AnimationCurve.easeInOut.rawValue)
         let options = UIView.AnimationOptions(rawValue: curveRaw << 16)
 
-        var inset: CGFloat = 0
+        var overlap: CGFloat = 0
         if note.name != UIResponder.keyboardWillHideNotification,
            let frameValue = note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? NSValue {
             let keyboardFrame = view.convert(frameValue.cgRectValue, from: nil)
-            // 键盘与 webView 的重叠高度
-            inset = max(0, webView.frame.maxY - keyboardFrame.minY)
+            overlap = max(0, webView.frame.maxY - keyboardFrame.minY)
         }
 
+        if overlap <= 0 {
+            applyKeyboardInset(0, duration: duration, options: options, scrollToFocus: false)
+            return
+        }
+
+        let expectedHeight = Double(webView.frame.height)
+        webView.evaluateJavaScript("window.innerHeight;") { [weak self] result, _ in
+            guard let self else { return }
+            let innerH = (result as? NSNumber)?.doubleValue ?? expectedHeight
+            // 允许 1px 误差：innerHeight 因取整可能与 frame 高度差一点
+            let pageShrank = innerH < expectedHeight - 1
+            let inset: CGFloat = pageShrank ? 0 : overlap
+            self.applyKeyboardInset(inset, duration: duration, options: options, scrollToFocus: true)
+        }
+    }
+
+    private func applyKeyboardInset(_ inset: CGFloat,
+                                    duration: Double,
+                                    options: UIView.AnimationOptions,
+                                    scrollToFocus: Bool) {
+        guard let webView else { return }
         UIView.animate(withDuration: duration, delay: 0, options: options) {
             webView.scrollView.contentInset.bottom = inset
             webView.scrollView.verticalScrollIndicatorInsets.bottom = inset
         } completion: { _ in
             // WebKit 可能在聚焦时才创建内部视图，这里再清一次输入助手栏
             self.stripInputAssistantBars()
-            if inset > 0 {
-                // 键盘完全展开后，把正在输入的控件滚进可视区
-                webView.evaluateJavaScript("""
-                (function () {
-                  var el = document.activeElement;
-                  if (el && typeof el.scrollIntoView === 'function') {
-                    el.scrollIntoView({ block: 'center', behavior: 'smooth' });
-                  }
-                })();
-                """, completionHandler: nil)
-            }
+            guard scrollToFocus else { return }
+            webView.evaluateJavaScript("""
+            (function () {
+              var el = document.activeElement;
+              if (el && typeof el.scrollIntoView === 'function') {
+                el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+              }
+            })();
+            """, completionHandler: nil)
         }
     }
 
